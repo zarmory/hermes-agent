@@ -2582,10 +2582,56 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
-            agent._anthropic_client = build_anthropic_client(
-                effective_key, agent._anthropic_base_url,
-                timeout=get_provider_request_timeout(agent.provider, agent.model),
-            )
+            _timeout = get_provider_request_timeout(agent.provider, agent.model)
+
+            # Provider dispatch, same shape as agent_init.py and
+            # ``run_agent._rebuild_anthropic_client``. Bedrock- and
+            # Vertex-hosted Claude speak the Anthropic Messages protocol but
+            # authenticate through their cloud's SDK, not an Anthropic API
+            # key. Without these branches a ``/model`` switch rebuilt a
+            # direct Anthropic client pointed at the cloud endpoint, so the
+            # SDK appended ``/v1/messages`` to a base_url that has no such
+            # route and every post-switch call failed (404 on Vertex).
+            if new_provider == "bedrock":
+                from agent.anthropic_adapter import build_anthropic_bedrock_client
+                # Prefer the region named by the endpoint we are switching TO;
+                # fall back to the region stashed at init, then AWS's default.
+                # Mirrors agent_init.py's regex over the resolved base_url.
+                _region_match = re.search(
+                    r"bedrock-runtime\.([a-z0-9-]+)\.", agent._anthropic_base_url or ""
+                )
+                _br_region = (
+                    _region_match.group(1)
+                    if _region_match
+                    else (getattr(agent, "_bedrock_region", None) or "us-east-1")
+                )
+                agent._bedrock_region = _br_region
+                agent._anthropic_client = build_anthropic_bedrock_client(_br_region)
+            elif new_provider == "vertex":
+                # Claude-on-Vertex. Project + region come from the shared
+                # vertex config chain (env → config.yaml → credentials), the
+                # same source agent_init uses, so switching INTO vertex works
+                # even when the session started on another provider and never
+                # stashed these attributes.
+                from agent.anthropic_vertex_adapter import (
+                    build_anthropic_vertex_client,
+                    get_anthropic_vertex_config,
+                )
+                try:
+                    _project_id, _vx_region = get_anthropic_vertex_config()
+                except Exception:  # noqa: BLE001
+                    _project_id, _vx_region = None, None
+                _project_id = _project_id or getattr(agent, "_vertex_project_id", None)
+                _vx_region = _vx_region or getattr(agent, "_vertex_region", None) or "global"
+                agent._vertex_project_id = _project_id
+                agent._vertex_region = _vx_region
+                agent._anthropic_client = build_anthropic_vertex_client(
+                    _project_id, _vx_region, timeout=_timeout,
+                )
+            else:
+                agent._anthropic_client = build_anthropic_client(
+                    effective_key, agent._anthropic_base_url, timeout=_timeout,
+                )
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
             agent.client = None
             agent._client_kwargs = {}
