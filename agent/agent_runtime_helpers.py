@@ -2420,10 +2420,40 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
-            agent._anthropic_client = build_anthropic_client(
-                effective_key, agent._anthropic_base_url,
-                timeout=get_provider_request_timeout(agent.provider, agent.model),
-            )
+
+            # Bedrock-hosted Claude speaks the Anthropic Messages protocol but
+            # authenticates through the AWS SDK, against a base_url that has no
+            # ``/v1/messages`` route. Dispatch on the provider here, the same
+            # way ``agent_init``, ``run_agent._rebuild_anthropic_client`` and
+            # ``run_agent._create_request_anthropic_client`` all do.
+            #
+            # Without this branch a ``/model`` switch replaced a working
+            # AnthropicBedrock client with a direct Anthropic one pointed at
+            # ``https://bedrock-runtime.<region>.amazonaws.com``, so every call
+            # after the switch failed. The restore/recover rebuild sites in
+            # this same module were never affected — only switch_model was
+            # missing the dispatch.
+            if new_provider == "bedrock":
+                from agent.anthropic_adapter import build_anthropic_bedrock_client
+                # Prefer the region named by the endpoint we are switching TO;
+                # fall back to the region stashed at init, then AWS's default.
+                # Mirrors the regex agent_init.py runs over the resolved
+                # base_url.
+                _region_match = re.search(
+                    r"bedrock-runtime\.([a-z0-9-]+)\.", agent._anthropic_base_url or ""
+                )
+                _br_region = (
+                    _region_match.group(1)
+                    if _region_match
+                    else (getattr(agent, "_bedrock_region", None) or "us-east-1")
+                )
+                agent._bedrock_region = _br_region
+                agent._anthropic_client = build_anthropic_bedrock_client(_br_region)
+            else:
+                agent._anthropic_client = build_anthropic_client(
+                    effective_key, agent._anthropic_base_url,
+                    timeout=get_provider_request_timeout(agent.provider, agent.model),
+                )
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
             agent.client = None
             agent._client_kwargs = {}
